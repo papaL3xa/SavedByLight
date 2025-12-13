@@ -22,6 +22,9 @@
 #include <linux/ctype.h>
 #include <linux/io_record.h>
 #include <linux/freezer.h>
+#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP)
+#include <linux/susfs_def.h>
+#endif
 
 #include <asm/elf.h>
 #include <asm/tlb.h>
@@ -32,6 +35,8 @@
 #include <linux/delay.h>
 #include "../../drivers/block/zram/zram_drv.h"
 #endif
+
+void __show_smap(struct seq_file *m, struct mem_size_stats *mss);
 
 void task_mem(struct seq_file *m, struct mm_struct *mm)
 {
@@ -378,6 +383,10 @@ static void show_vma_header_prefix(struct seq_file *m,
 		   MAJOR(dev), MINOR(dev), ino);
 }
 
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+extern void susfs_sus_ino_for_show_map_vma(unsigned long ino, dev_t *out_dev, unsigned long *out_ino);
+#endif
+
 static void
 show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
 {
@@ -392,8 +401,23 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
 
 	if (file) {
 		struct inode *inode = file_inode(vma->vm_file);
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+		if (unlikely(inode->i_mapping->flags & BIT_SUS_MAPS) && susfs_is_current_proc_umounted()) {
+			show_vma_header_prefix(m, vma->vm_start, vma->vm_end, flags, pgoff, dev, ino);
+			goto done;
+		}
+#endif
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+		if (unlikely(inode->i_mapping->flags & BIT_SUS_KSTAT)) {
+			susfs_sus_ino_for_show_map_vma(inode->i_ino, &dev, &ino);
+			goto bypass_orig_flow;
+		}
+#endif
 		dev = inode->i_sb->s_dev;
 		ino = inode->i_ino;
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+bypass_orig_flow:
+#endif
 		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
 	}
 
@@ -916,6 +940,12 @@ static int show_smap(struct seq_file *m, void *v, int is_pid)
 	}
 
 	if (!rollup_mode)
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+	if (vma->vm_file &&
+		unlikely(file_inode(vma->vm_file)->i_mapping->flags & BIT_SUS_MAPS) &&
+		susfs_is_current_proc_umounted())
+	{
+		show_map_vma(m, vma, is_pid);
 		seq_printf(m,
 			   "Size:           %8lu kB\n"
 			   "KernelPageSize: %8lu kB\n"
@@ -924,7 +954,22 @@ static int show_smap(struct seq_file *m, void *v, int is_pid)
 			   vma_kernel_pagesize(vma) >> 10,
 			   vma_mmu_pagesize(vma) >> 10);
 
-
+		__show_smap(m, mss);
+		seq_puts(m, "VmFlags: mr mw me");
+		seq_putc(m, '\n');
+		goto bypass_orig_flow;
+	}
+#endif
+		seq_printf(m,
+			   "Size:           %8lu kB\n"
+			   "KernelPageSize: %8lu kB\n"
+			   "MMUPageSize:    %8lu kB\n",
+			   (vma->vm_end - vma->vm_start) >> 10,
+			   vma_kernel_pagesize(vma) >> 10,
+			   vma_mmu_pagesize(vma) >> 10);
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+bypass_orig_flow:
+#endif
 	if (!rollup_mode || last_vma)
 		seq_printf(m,
 			   "Rss:            %8lu kB\n"
@@ -967,9 +1012,21 @@ static int show_smap(struct seq_file *m, void *v, int is_pid)
 			   (unsigned long)(mss->pss_locked >> (10 + PSS_SHIFT)));
 
 	if (!rollup_mode) {
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+		if (vma->vm_file &&
+			unlikely(file_inode(vma->vm_file)->i_mapping->flags & BIT_SUS_MAPS) &&
+			susfs_is_current_proc_umounted())
+		{
+			memset(mss, 0, sizeof(*mss));
+			goto bypass_orig_flow2;
+		}
+#endif
 		arch_show_smap(m, vma);
 		show_smap_vma_flags(m, vma);
 	}
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+bypass_orig_flow2:
+#endif
 	m_cache_vma(m, vma);
 	return ret;
 }
@@ -1604,6 +1661,9 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
 	unsigned long start_vaddr;
 	unsigned long end_vaddr;
 	int ret = 0, copied = 0;
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+	struct vm_area_struct *vma;
+#endif
 
 	if (!mm || !mmget_not_zero(mm))
 		goto out;
@@ -1662,6 +1722,16 @@ static ssize_t pagemap_read(struct file *file, char __user *buf,
 		down_read(&mm->mmap_sem);
 		ret = walk_page_range(start_vaddr, end, &pagemap_walk);
 		up_read(&mm->mmap_sem);
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+		vma = find_vma(mm, start_vaddr);
+		if (vma && vma->vm_file) {
+			struct inode *inode = file_inode(vma->vm_file);
+			if (unlikely(inode->i_mapping->flags & BIT_SUS_MAPS) && susfs_is_current_proc_umounted()) {
+				pm.buffer->pme = 0;
+			}
+		}
+#endif
+
 		start_vaddr = end;
 
 		len = min(count, PM_ENTRY_BYTES * pm.pos);
@@ -2307,181 +2377,46 @@ const struct file_operations proc_tid_numa_maps_operations = {
 };
 #endif /* CONFIG_NUMA */
 
-#ifdef CONFIG_PAGE_BOOST
-/*
- * Currently, target_file_name is shared by all filemap_info nodes
- * as we do not access this node in parallel. (do not need synchronization also)
- */
-#include <linux/atomic.h>
-static atomic_t filemap_fd_opened = ATOMIC_INIT(0);
-char target_file_name[MAX_PAGE_BOOST_FILEPATH_LEN + 1] = "";
-
-static inline bool try_to_get_filemap_fd(void)
+void __show_smap(struct seq_file *m, struct mem_size_stats *mss)
 {
-	/* only 1 context is allowed at a time */
-	if (atomic_inc_return(&filemap_fd_opened) == 1)
-		return true;
-	else {
-		atomic_dec(&filemap_fd_opened);
-		return false;
-	}
-}
-
-static inline void put_filemap_fd(void)
-{
-	atomic_dec(&filemap_fd_opened);
-}
-
-static void
-show_filemap_vma(struct seq_file *m, struct vm_area_struct *vma)
-{
-	struct file *file = vma->vm_file;
-	struct proc_filemap_private *priv = m->private;
-	char strbuf[MAX_PAGE_BOOST_FILEPATH_LEN];
-	char *pathname;
-
-	if (!file)
-		return;
-
-	pathname = d_path(&file->f_path, strbuf, MAX_PAGE_BOOST_FILEPATH_LEN);
-	if (IS_ERR(pathname))
-		return;
-
-	if (priv->show_list) {
-		if (!strncmp(pathname, "/data", 5) ||
-		    !strncmp(pathname, "/system", 7)) {
-			seq_puts(m, pathname);
-			seq_putc(m, '\n');
-		}
-	}
-}
-
-static int show_filemap(struct seq_file *m, void *v)
-{
-	show_filemap_vma(m, v);
-	m_cache_vma(m, v);
-	return 0;
-}
-
-static const struct seq_operations proc_pid_filemap_op = {
-	.start	= m_start,
-	.next	= m_next,
-	.stop	= m_stop,
-	.show	= show_filemap,
-};
-
-static int pid_filemap_list_open(struct inode *inode, struct file *file)
-{
-	int psize = sizeof(struct proc_filemap_private);
-	const struct seq_operations *ops = &proc_pid_filemap_op;
-	struct proc_filemap_private *priv = __seq_open_private(file, ops,
-							       psize);
-
-	if (!priv)
-		return -ENOMEM;
-	if (!try_to_get_filemap_fd())
-		return -EINVAL;
-
-	priv->maps_private.inode = inode;
-	priv->maps_private.mm = proc_mem_open(inode, PTRACE_MODE_READ);
-	priv->show_list = true;
-	if (IS_ERR(priv->maps_private.mm)) {
-		int err = PTR_ERR(priv->maps_private.mm);
-
-		put_filemap_fd();
-		seq_release_private(inode, file);
-		return err;
-	}
-
-	return 0;
-}
-
-/* common release for filemap_list and filemap_info */
-static int proc_filemap_release(struct inode *inode, struct file *file)
-{
-	struct seq_file *seq = file->private_data;
-	struct proc_filemap_private *priv = seq->private;
-
-	if (priv->maps_private.mm)
-		mmdrop(priv->maps_private.mm);
-
-	put_filemap_fd();
-	return seq_release_private(inode, file);
-}
-
-/* List mapped files for this process */
-const struct file_operations proc_pid_filemap_list_operations = {
-	.open		= pid_filemap_list_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= proc_filemap_release,
-};
-
-#ifdef CONFIG_PAGE_BOOST_RECORDING
-static ssize_t pid_io_record_read(struct file *file, char __user *buf,
-			size_t count, loff_t *ppos)
-{
-	return read_record(buf, count, ppos);
-}
-
-static ssize_t pid_io_record_write(struct file *file,
-					       const char __user *buf,
-					       size_t count, loff_t *ppos)
-{
-	char buffer[PROC_NUMBUF];
-	int itype;
-	enum io_record_cmd_types type;
-	int rv;
-	struct task_struct *task;
-	bool ret = true;
-
-	memset(buffer, 0, sizeof(buffer));
-	if (count > sizeof(buffer) - 1)
-		count = sizeof(buffer) - 1;
-	if (copy_from_user(buffer, buf, count))
-		return -EFAULT;
-	rv = kstrtoint(strstrip(buffer), 10, &itype);
-	if (rv < 0)
-		return rv;
-
-	task = get_proc_task(file_inode(file));
-	if (!task)
-		return -EFAULT;
-
-	type = (enum io_record_cmd_types)itype;
-	if (type < IO_RECORD_INIT || type > IO_RECORD_POST_PROCESSING) {
-		put_task_struct(task);
-		return -EINVAL;
-	}
-
-	switch (type) {
-	case IO_RECORD_INIT:
-		ret = init_record();
-		break;
-	case IO_RECORD_START:
-		ret = start_record((int)task_pid_nr(task));
-		break;
-	case IO_RECORD_STOP:
-		ret = stop_record();
-		break;
-	case IO_RECORD_POST_PROCESSING:
-		ret = post_processing_records();
-		break;
-	default:
-		break;
-	}
-	put_task_struct(task);
-
-	if (!ret)
-		count = -EINVAL;
-
-	return count;
-}
-
-const struct file_operations proc_pid_io_record_operations = {
-	.read		= pid_io_record_read,
-	.write		= pid_io_record_write,
-	.llseek		= noop_llseek,
-};
+    seq_printf(m,
+           "Rss:            %8lu kB\n"
+           "Pss:            %8lu kB\n"
+           "Shared_Clean:   %8lu kB\n"
+           "Shared_Dirty:   %8lu kB\n"
+           "Private_Clean:  %8lu kB\n"
+           "Private_Dirty:  %8lu kB\n"
+           "Referenced:     %8lu kB\n"
+           "Anonymous:      %8lu kB\n"
+           "LazyFree:       %8lu kB\n"
+           "AnonHugePages:  %8lu kB\n"
+           "ShmemPmdMapped: %8lu kB\n"
+           "Shared_Hugetlb: %8lu kB\n"
+           "Private_Hugetlb: %7lu kB\n"
+           "Swap:           %8lu kB\n"
+           "SwapPss:        %8lu kB\n"
+#ifdef CONFIG_ZRAM_LRU_WRITEBACK
+           "Writeback:      %8lu kB\n"
 #endif
+           "Locked:         %8lu kB\n",
+           mss->resident >> 10,
+           (unsigned long)(mss->pss >> (10 + PSS_SHIFT)),
+           mss->shared_clean  >> 10,
+           mss->shared_dirty  >> 10,
+           mss->private_clean >> 10,
+           mss->private_dirty >> 10,
+           mss->referenced >> 10,
+           mss->anonymous >> 10,
+           mss->lazyfree >> 10,
+           mss->anonymous_thp >> 10,
+           mss->shmem_thp >> 10,
+           mss->shared_hugetlb >> 10,
+           mss->private_hugetlb >> 10,
+           mss->swap >> 10,
+           (unsigned long)(mss->swap_pss >> (10 + PSS_SHIFT)),
+#ifdef CONFIG_ZRAM_LRU_WRITEBACK
+           mss->writeback >> 10,
 #endif
+           (unsigned long)(mss->pss_locked >> (10 + PSS_SHIFT)));
+}
+EXPORT_SYMBOL(__show_smap);
